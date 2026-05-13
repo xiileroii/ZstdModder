@@ -5,9 +5,51 @@ import subprocess
 import threading
 import os
 import sys
+import concurrent.futures
 
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
+
+
+class OverwritePromptWindow(ctk.CTkToplevel):
+    def __init__(self, parent, target_name):
+        super().__init__(parent)
+        self.title("Overwrite Existing Mod?")
+        self.geometry("450x150")
+        self.attributes("-topmost", True)
+        self.result = None
+
+        ctk.CTkLabel(
+            self,
+            text=f"Mod already exists for '{target_name}'.\nOverwrite it?",
+            font=ctk.CTkFont(weight="bold"),
+        ).pack(pady=20)
+
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=10, pady=5)
+
+        ctk.CTkButton(
+            btn_frame, text="Yes", command=lambda: self.set_result("yes"), width=60
+        ).pack(side="left", padx=5, expand=True)
+        ctk.CTkButton(
+            btn_frame, text="No", command=lambda: self.set_result("no"), width=60
+        ).pack(side="left", padx=5, expand=True)
+        ctk.CTkButton(
+            btn_frame,
+            text="Yes to All",
+            command=lambda: self.set_result("yes_all"),
+            width=80,
+        ).pack(side="left", padx=5, expand=True)
+        ctk.CTkButton(
+            btn_frame,
+            text="No to All",
+            command=lambda: self.set_result("no_all"),
+            width=80,
+        ).pack(side="left", padx=5, expand=True)
+
+    def set_result(self, res):
+        self.result = res
+        self.destroy()
 
 
 class TargetSelectionWindow(ctk.CTkToplevel):
@@ -20,11 +62,11 @@ class TargetSelectionWindow(ctk.CTkToplevel):
         self.selected_target = None
 
         ctk.CTkLabel(
-            self, 
-            text=f"File: {filename}", 
+            self,
+            text=f"File: {filename}",
             font=ctk.CTkFont(weight="bold"),
             wraplength=360,
-            justify="center"
+            justify="center",
         ).pack(pady=(10, 0), padx=20)
 
         self.search_var = ctk.StringVar()
@@ -107,13 +149,23 @@ class ZstdModderUI(ctk.CTk):
             else os.path.join(script_dir, "ZstdModder")
         )
 
+        self.app_version = "1.0.0"
+        version_file = os.path.join(script_dir, "VERSION")
+        if os.path.exists(version_file):
+            with open(version_file, "r") as f:
+                self.app_version = f.read().strip()
+
+        self.title(f"ZstdModder v{self.app_version}")
+
         self.selected_files = []
 
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(5, weight=1)
 
         self.title_label = ctk.CTkLabel(
-            self, text="ZstdModder", font=ctk.CTkFont(size=24, weight="bold")
+            self,
+            text=f"ZstdModder v{self.app_version}",
+            font=ctk.CTkFont(size=24, weight="bold"),
         )
         self.title_label.grid(
             row=0, column=0, columnspan=3, padx=20, pady=(20, 10), sticky="w"
@@ -165,25 +217,11 @@ class ZstdModderUI(ctk.CTk):
             fg_color="gray",
         ).pack(side="left", padx=5)
 
-        # Advanced Settings Frame (Cleaned up!)
-        self.adv_frame = ctk.CTkFrame(self)
-        self.adv_frame.grid(
-            row=4, column=0, columnspan=3, padx=20, pady=10, sticky="ew"
-        )
-        self.overwrite_var = ctk.StringVar(value="on")
-        ctk.CTkCheckBox(
-            self.adv_frame,
-            text="Overwrite Existing Mods",
-            variable=self.overwrite_var,
-            onvalue="on",
-            offvalue="off",
-        ).pack(side="left", padx=20, pady=10)
-
         self.console = ctk.CTkTextbox(
             self, font=ctk.CTkFont(family="Consolas", size=12)
         )
         self.console.grid(
-            row=5, column=0, columnspan=3, padx=20, pady=10, sticky="nsew"
+            row=4, column=0, columnspan=3, padx=20, pady=10, sticky="nsew"
         )
         self.console.insert(
             "0.0",
@@ -199,7 +237,7 @@ class ZstdModderUI(ctk.CTk):
             command=self.start_build,
         )
         self.build_btn.grid(
-            row=6, column=0, columnspan=3, padx=20, pady=(10, 20), sticky="ew"
+            row=5, column=0, columnspan=3, padx=20, pady=(10, 20), sticky="ew"
         )
 
         self.load_config()
@@ -287,25 +325,34 @@ class ZstdModderUI(ctk.CTk):
         event.wait()
         return result[0]
 
+    def prompt_overwrite_blocking(self, target_name):
+        result = [None]
+        event = threading.Event()
+
+        def show_dialog():
+            dialog = OverwritePromptWindow(self, target_name)
+            self.wait_window(dialog)
+            result[0] = dialog.result
+            event.set()
+
+        self.after(0, show_dialog)
+        event.wait()
+        return result[0]
 
     def run_process(self):
         try:
-            # 0. The SAFE way to hide windows without deadlocking C++ std::system calls!
             startupinfo = None
             if sys.platform == "win32":
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                 startupinfo.wShowWindow = 0  # 0 equals SW_HIDE (Invisible Window)
 
-            # 1. Fetch valid BARS names silently from C++
             self.after(
                 0,
                 self.log,
                 "\n--- Starting Batch Process ---\n[System] Parsing BARS targets...\n",
             )
 
-            # CRITICAL FIX 1: stdin=subprocess.DEVNULL prevents the PyInstaller deadlock
-            # CRITICAL FIX 2: startupinfo prevents the C++ std::system deadlock
             proc = subprocess.run(
                 [self.exe_name, "--list"],
                 capture_output=True,
@@ -314,7 +361,6 @@ class ZstdModderUI(ctk.CTk):
                 stdin=subprocess.DEVNULL,
             )
 
-            # STRICT PARSING
             valid_names = []
             for line in proc.stdout.splitlines():
                 if line.startswith("BARS_TARGET:"):
@@ -328,7 +374,6 @@ class ZstdModderUI(ctk.CTk):
                 )
                 return
 
-            # Determine files to process
             queue = self.selected_files
             if not queue:
                 self.after(
@@ -350,9 +395,8 @@ class ZstdModderUI(ctk.CTk):
                 )
                 return
 
-            processed_count = 0
-
-            # 2. Process each file!
+            # Phase 1: Determine Targets
+            tasks = []
             for filepath in queue:
                 basename = os.path.splitext(os.path.basename(filepath))[0]
                 target_name = basename
@@ -369,10 +413,81 @@ class ZstdModderUI(ctk.CTk):
                         )
                         continue
 
-                cmd = [self.exe_name, filepath, "-t", target_name, "--no-patch"]
-                if self.overwrite_var.get() == "on":
-                    cmd.append("-y")
+                tasks.append((filepath, target_name))
 
+            if not tasks:
+                self.after(
+                    0,
+                    self.log,
+                    "\n[System] No files to process. Skipping BARS patcher.\n",
+                )
+                return
+
+            # Phase 2: Overwrite Check
+            existing_mods = set()
+            atmo_path = self.atmo_entry.get().strip()
+            if atmo_path:
+                stream_dir = os.path.join(
+                    atmo_path, "romfs", "Sound", "Resource", "Stream"
+                )
+                if os.path.exists(stream_dir):
+                    for f in os.listdir(stream_dir):
+                        if f.lower().endswith(".bwav"):
+                            existing_mods.add(os.path.splitext(f)[0])
+
+            final_tasks = []
+            overwrite_all = False
+            skip_all = False
+
+            for filepath, target_name in tasks:
+                if target_name in existing_mods:
+                    if skip_all:
+                        self.after(
+                            0, self.log, f"[System] Skipped existing '{target_name}'\n"
+                        )
+                        continue
+                    elif overwrite_all:
+                        final_tasks.append((filepath, target_name))
+                    else:
+                        res = self.prompt_overwrite_blocking(target_name)
+                        if res == "yes_all":
+                            overwrite_all = True
+                            final_tasks.append((filepath, target_name))
+                        elif res == "no_all":
+                            skip_all = True
+                            self.after(
+                                0,
+                                self.log,
+                                f"[System] Skipped existing '{target_name}'\n",
+                            )
+                        elif res == "yes":
+                            final_tasks.append((filepath, target_name))
+                        else:  # no or closed window
+                            self.after(
+                                0,
+                                self.log,
+                                f"[System] Skipped existing '{target_name}'\n",
+                            )
+                else:
+                    final_tasks.append((filepath, target_name))
+
+            if not final_tasks:
+                self.after(
+                    0,
+                    self.log,
+                    "\n[System] No files to process. Skipping BARS patcher.\n",
+                )
+                return
+
+            # Phase 3: Concurrent Execution
+            self.after(
+                0,
+                self.log,
+                f"\n[System] Processing {len(final_tasks)} files concurrently...\n",
+            )
+
+            def run_task(filepath, target_name):
+                cmd = [self.exe_name, filepath, "-t", target_name, "--no-patch", "-y"]
                 p = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
@@ -383,23 +498,20 @@ class ZstdModderUI(ctk.CTk):
                     bufsize=1,
                     startupinfo=startupinfo,
                 )
+                output = []
                 for line in p.stdout:
-                    self.after(0, self.log, line)
+                    output.append(line)
                 p.wait()
+                return output
 
-                processed_count += 1
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                futures = [executor.submit(run_task, f, t) for f, t in final_tasks]
+                for future in concurrent.futures.as_completed(futures):
+                    for line in future.result():
+                        self.after(0, self.log, line)
 
-            if processed_count == 0:
-                self.after(
-                    0,
-                    self.log,
-                    "\n[System] No files were processed. Skipping BARS patcher.\n",
-                )
-                return
-
-            # 3. Finalize Deployment
+            # Phase 4: Finalize Deployment
             self.after(0, self.log, "\n[System] Finalizing BARS Patching...\n")
-
             p = subprocess.Popen(
                 [self.exe_name, "--patch-only"],
                 stdout=subprocess.PIPE,

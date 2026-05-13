@@ -17,24 +17,29 @@
 #include <unistd.h>
 #endif
 
+// Fallback just in case the Makefile didn't define it
+#ifndef APP_VERSION
+#define APP_VERSION "1.0.0"
+#endif
+
 namespace fs = std::filesystem;
 
 // OS Detection for command prefixes
 #ifdef _WIN32
 constexpr const char *kFfmpeg = "ffmpeg.exe";
-constexpr const char *kVgmstream = "vgmstream-cli.exe";
-constexpr const char *kConverter = "brstm_converter.exe";
 constexpr const char *kZstd = "zstd.exe";
-constexpr const char *kPatcher = "auto_bars_patcher.exe";
-constexpr const char *kNullDevice = "NUL";
 #else
 constexpr const char *kFfmpeg = "ffmpeg";
-constexpr const char *kVgmstream = "vgmstream-cli";
-constexpr const char *kConverter = "./brstm_converter";
 constexpr const char *kZstd = "zstd";
-constexpr const char *kPatcher = "./auto_bars_patcher";
-constexpr const char *kNullDevice = "/dev/null";
 #endif
+
+// Statically linked tools
+extern int brstm_converter_main(int argc, char **args);
+extern int auto_bars_patcher_main(int argc, char **args);
+
+// Global State
+bool g_list_only = false;
+std::string g_exe_path;
 
 // --- Structs ---
 struct AudioMetadata
@@ -59,9 +64,6 @@ struct AppConfig
     std::string game_dump_path;
 };
 
-// Global Execution Flags
-bool g_list_only = false;
-
 // --- Helpers ---
 std::string Trim(const std::string &s)
 {
@@ -76,70 +78,43 @@ bool EndsWith(const std::string &str, const std::string &suffix)
            str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
-AudioMetadata GetAudioMetadata(const fs::path &path, int subsong = 0)
+bool IsValidAudioExtension(const fs::path &path)
 {
-    AudioMetadata meta;
-    if (!fs::is_regular_file(path))
+    std::string ext = path.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    return (ext == ".flac" || ext == ".wav" || ext == ".mp3" || ext == ".ogg" || ext == ".m4a");
+}
+
+// --- THE NATIVE BWAV PARSER ---
+AudioMetadata GetBwavMetadata(const fs::path &path)
+{
+    AudioMetadata meta = {false, 0, 0};
+
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
         return meta;
 
-    std::string prefix = std::string(kVgmstream) + " -m ";
-    if (subsong > 0)
-    {
-        prefix += "-s " + std::to_string(subsong) + " ";
-    }
-    std::string suffix = std::string(" 2> ") + kNullDevice;
-
-    FILE *pipe = nullptr;
-
-#ifdef _WIN32
-    std::wstring wcmd = std::wstring(prefix.begin(), prefix.end()) + L"\"" +
-                        path.wstring() + L"\"" +
-                        std::wstring(suffix.begin(), suffix.end());
-    pipe = _wpopen(wcmd.c_str(), L"r");
-#else
-    std::string cmd = prefix + "\"" + path.string() + "\"" + suffix;
-    pipe = popen(cmd.c_str(), "r");
-#endif
-
-    if (!pipe)
+    uint8_t header[24];
+    if (!file.read(reinterpret_cast<char *>(header), 24))
         return meta;
 
-    char buffer[256];
-    std::string result = "";
-    while (fgets(buffer, sizeof(buffer), pipe) != nullptr)
+    if (header[0] != 'B' || header[1] != 'W' || header[2] != 'A' || header[3] != 'V')
+        return meta;
+
+    bool is_big_endian = (header[4] == 0xFE && header[5] == 0xFF);
+
+    if (is_big_endian)
     {
-        result += buffer;
+        meta.channels = (header[0x0E] << 8) | header[0x0F];
+        meta.sample_rate = (header[0x14] << 24) | (header[0x15] << 16) | (header[0x16] << 8) | header[0x17];
+    }
+    else
+    {
+        meta.channels = (header[0x0F] << 8) | header[0x0E];
+        meta.sample_rate = (header[0x17] << 24) | (header[0x16] << 16) | (header[0x15] << 8) | header[0x14];
     }
 
-#ifdef _WIN32
-    _pclose(pipe);
-#else
-    pclose(pipe);
-#endif
-
-    size_t ch_pos = result.find("channels: ");
-    if (ch_pos != std::string::npos)
-    {
-        try
-        {
-            meta.channels = std::stoi(result.substr(ch_pos + 10));
-            meta.is_audio = true;
-        }
-        catch (...)
-        {
-        }
-    }
-    size_t sr_pos = result.find("sample rate: ");
-    if (sr_pos != std::string::npos)
-    {
-        try
-        {
-            meta.sample_rate = std::stoi(result.substr(sr_pos + 13));
-        }
-        catch (...)
-        {
-        }
-    }
+    meta.is_audio = true;
     return meta;
 }
 
@@ -161,11 +136,8 @@ AppConfig GetOrPromptConfig(bool is_headless)
         config_file.close();
     }
 
-    // Fallback for legacy setups
     if (config.game_dump_path.empty() && fs::exists("Stream"))
-    {
         config.game_dump_path = "Stream";
-    }
 
     if (!is_headless)
     {
@@ -196,14 +168,13 @@ AppConfig GetOrPromptConfig(bool is_headless)
         if (!g_list_only)
         {
             std::cerr << "[Fatal Error] config.ini is missing Atmosphere or Game Dump paths.\n";
-            std::cerr << "Please configure these directories in the UI.\n";
             exit(1);
         }
     }
     return config;
 }
 
-// --- Cross-Platform Keyboard for CLI Fallback ---
+// --- Cross-Platform Keyboard ---
 enum KeyAction
 {
     kUp,
@@ -283,28 +254,37 @@ class CrossPlatformModder
 public:
     void RunCmd(const std::string &cmd)
     {
-        std::cout << "[Executing]: " << cmd << "\n";
-        if (std::system(cmd.c_str()) != 0)
+        std::cout << "[Executing]: " << cmd << std::endl; // Flush guarantees we see this before a crash
+        int ret = std::system(cmd.c_str());
+        if (ret != 0)
         {
-            std::cerr << "Command failed.\n";
+            std::cerr << "Command failed with exit code " << ret << ".\n";
             exit(1);
         }
     }
 
-    // --- THE COMPATIBILITY SHIM FOR OPENREVOLUTION ---
+    // --- BUSYBOX ROUTING ---
     void RunConverter(const std::string &input, const std::string &output)
     {
 #ifdef _WIN32
         _putenv("__COMPAT_LAYER=VistaSP2");
-        std::cout << "[System]: Applying VistaSP2 Compatibility Layer for brstm_converter...\n";
+        std::cout << "[System]: Applying VistaSP2 Compatibility Layer for integrated brstm_converter...\n";
 #endif
 
-        std::string cmd = std::string(kConverter) + " \"" + input + "\" -o \"" + output + "\"";
+        // The outer double-quotes prevent cmd.exe from stripping inner path quotes and failing syntax
+        std::string cmd = "\"\"" + g_exe_path + "\" brstm_converter \"" + input + "\" -o \"" + output + "\"\"";
         RunCmd(cmd);
 
 #ifdef _WIN32
         _putenv("__COMPAT_LAYER=");
 #endif
+    }
+
+    void RunPatcher(const std::string &og_stream_dir, const std::string &mod_stream_dir, const std::string &og_bars, const std::string &patched_bars)
+    {
+        std::cout << "[System]: Running integrated auto_bars_patcher...\n";
+        std::string cmd = "\"\"" + g_exe_path + "\" auto_bars_patcher --og-stream-dir \"" + og_stream_dir + "\" --mod-stream-dir \"" + mod_stream_dir + "\" --og-bars-file \"" + og_bars + "\" --bars-output-file \"" + patched_bars + "\"\"";
+        RunCmd(cmd);
     }
 
     std::string ReadNullTerminatedString(std::ifstream &fs)
@@ -392,7 +372,6 @@ public:
         int lines_to_print = display_limit + 3;
         std::string query = "";
 
-        // CRITICAL BUG FIX: Carve out blank space before moving the cursor!
         for (int i = 0; i < lines_to_print; i++)
             std::cout << "\n";
 
@@ -450,7 +429,7 @@ public:
         }
     }
 
-    void Build(const fs::path &input_path, const AudioMetadata &input_meta,
+    void Build(const fs::path &input_path,
                const std::vector<BarsTarget> &bars_targets,
                const std::vector<std::string> &all_bars_names,
                const std::vector<std::string> &existing_mods,
@@ -464,9 +443,7 @@ public:
 
         std::cout << "\n========================================\n";
         std::cout << "[Processing]: " << full_filename << "\n";
-        std::cout << "[vgmstream]: Input file has " << input_meta.channels << " channels at " << input_meta.sample_rate << "Hz.\n";
 
-        // 1. Target Name Handling
         if (!target_override.empty())
         {
             target_bwav_name = target_override;
@@ -486,60 +463,33 @@ public:
             }
         }
 
-        // 2. Channel Detection
-        int final_channels = input_meta.channels;
-        bool nintendo_meta_found = false;
+        int final_channels = channel_override > 0 ? channel_override : 2;
+        int final_sample_rate = 48000;
 
-        if (channel_override > 0)
+        if (channel_override <= 0)
         {
-            final_channels = channel_override;
-            nintendo_meta_found = true;
-            std::cout << "[UI Override]: Forcing channel count -> " << final_channels << "\n";
-        }
-        else
-        {
-            fs::path original_bwav_path = fs::path(config.game_dump_path) / (target_bwav_name + ".bwav");
-            if (fs::exists(original_bwav_path))
+            fs::path dump_bwav = fs::path(config.game_dump_path) / (target_bwav_name + ".bwav");
+            if (fs::exists(dump_bwav))
             {
-                AudioMetadata nintendo_meta = GetAudioMetadata(original_bwav_path);
+                AudioMetadata nintendo_meta = GetBwavMetadata(dump_bwav);
                 if (nintendo_meta.is_audio)
                 {
                     final_channels = nintendo_meta.channels;
-                    nintendo_meta_found = true;
-                    std::cout << "[vgmstream]: Analyzed original Nintendo file.\n";
-                    std::cout << "             -> Game expects exactly " << final_channels << " channels.\n";
+                    final_sample_rate = nintendo_meta.sample_rate;
+                    std::cout << "[Native Parser]: Analyzed original Nintendo file.\n";
+                    std::cout << "                 -> Game expects exactly " << final_channels << " channels at " << final_sample_rate << "Hz.\n";
                 }
-            }
-        }
-
-        if (!nintendo_meta_found)
-        {
-            if (is_headless)
-            {
-                std::cerr << "\n[Fatal Error] Could not auto-detect expected channels.\n";
-                std::cerr << "Please specify channels in the UI dropdown.\n";
-                return;
             }
             else
             {
-                std::string input;
-                while (true)
-                {
-                    std::cout << "\n[?] Failed to read internal data. How many channels does the game expect?\n";
-                    std::cout << "  [1] Mono (Standard for Sound Effects)\n";
-                    std::cout << "  [2] Stereo (Standard for BGM)\nEnter 1 or 2: ";
-                    std::getline(std::cin, input);
-                    input = Trim(input);
-                    if (input == "1" || input == "2")
-                    {
-                        final_channels = std::stoi(input);
-                        break;
-                    }
-                }
+                std::cout << "[Warning]: Original .bwav not found in dump. Defaulting to Stereo 48kHz.\n";
             }
         }
+        else
+        {
+            std::cout << "[UI Override]: Forcing channel count -> " << final_channels << "\n";
+        }
 
-        // 3. Overwrite Protection
         if (std::find(existing_mods.begin(), existing_mods.end(), target_bwav_name) != existing_mods.end())
         {
             if (auto_yes)
@@ -549,7 +499,6 @@ public:
             else if (is_headless)
             {
                 std::cerr << "\n[Fatal Error] Mod exists for '" << target_bwav_name << "'.\n";
-                std::cerr << "Check 'Overwrite Existing Mods' to proceed.\n";
                 return;
             }
             else
@@ -573,8 +522,8 @@ public:
 
         std::string output_bwav = target_bwav_name + ".bwav";
         std::string safe_input_ext = input_path.extension().string();
-        std::string safe_input = "temp_safe_input" + safe_input_ext;
-        std::string temp_wav = "temp_safe_output.wav";
+        std::string safe_input = "temp_in_" + target_bwav_name + safe_input_ext;
+        std::string temp_wav = "temp_out_" + target_bwav_name + ".wav";
 
         std::error_code ec;
         fs::copy_file(input_path, safe_input, fs::copy_options::overwrite_existing, ec);
@@ -587,7 +536,7 @@ public:
         std::cout << "\nConverting and Encoding -> " << output_bwav << "\n";
 
         RunCmd(std::string(kFfmpeg) + " -y -i \"" + safe_input +
-               "\" -ar 48000 -ac " + std::to_string(final_channels) + " \"" + temp_wav + "\"");
+               "\" -ar " + std::to_string(final_sample_rate) + " -ac " + std::to_string(final_channels) + " \"" + temp_wav + "\"");
 
         RunConverter(temp_wav, "ModStream/" + output_bwav);
 
@@ -603,7 +552,6 @@ public:
 
     void FinalizeBuild(const AppConfig &config, const std::vector<BarsTarget> &targets)
     {
-
         bool has_mods = false;
         if (fs::exists("ModStream"))
         {
@@ -623,14 +571,10 @@ public:
         }
 
         std::cout << "\n[Patching BARS files]\n";
-        std::cout << "\n[Patching BARS files]\n";
 
         for (const auto &target : targets)
         {
-            RunCmd(std::string(kPatcher) +
-                   " --og-stream-dir \"" + config.game_dump_path + "\" --mod-stream-dir ./ModStream "
-                                                                   "--og-bars-file " +
-                   target.uncompressed + " --bars-output-file " + target.patched);
+            RunPatcher(config.game_dump_path, "./ModStream", target.uncompressed, target.patched);
             RunCmd(std::string(kZstd) + " -f " + target.patched + " -o " + target.patched_zstd);
         }
 
@@ -677,9 +621,49 @@ public:
 
 int main(int argc, char *argv[])
 {
+    // FATAL FIX 2: Disable all buffering immediately so Python captures crash logs!
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
 #endif
+
+    if (argc > 0 && argv[0] != nullptr)
+    {
+        g_exe_path = argv[0];
+    }
+    else
+    {
+        g_exe_path = "ZstdModder.exe"; // Fallback
+    }
+
+    // --- BUSYBOX ROUTING ---
+    // If the executable is called with an internal tool name as the first argument,
+    // intercept it, shift the arguments, and run the statically linked module.
+    if (argc > 1)
+    {
+        std::string tool_mode = argv[1];
+        if (tool_mode == "brstm_converter" || tool_mode == "auto_bars_patcher")
+        {
+            std::vector<char *> sub_argv;
+            sub_argv.push_back(argv[0]);
+            for (int i = 2; i < argc; ++i)
+                sub_argv.push_back(argv[i]);
+
+            // FATAL FIX 1: Provide the NULL terminator to prevent C library segfaults!
+            sub_argv.push_back(nullptr);
+
+            int sub_argc = sub_argv.size() - 1; // Size minus the nullptr
+
+            if (tool_mode == "brstm_converter")
+                return brstm_converter_main(sub_argc, sub_argv.data());
+            if (tool_mode == "auto_bars_patcher")
+                return auto_bars_patcher_main(sub_argc, sub_argv.data());
+        }
+    }
+
+    std::cout << "ZstdModder v" << APP_VERSION << " initialized.\n";
 
     fs::path input_path;
     bool is_headless = false, auto_yes = false;
@@ -802,39 +786,43 @@ int main(int argc, char *argv[])
     std::vector<BarsTarget> b_targets;
     std::vector<std::string> all_names;
 
-    for (const auto &e : fs::directory_iterator(fs::current_path()))
+    bool should_extract = g_list_only || patch_only || (!is_headless && !no_patch);
+
+    if (should_extract)
     {
-        std::string fn = e.path().filename().string();
-        if (EndsWith(fn, ".bars.zs") && !EndsWith(fn, "Upd.bars.zs"))
+        for (const auto &e : fs::directory_iterator(fs::current_path()))
         {
-            BarsTarget t;
-            t.original_zstd = fn;
-            t.uncompressed = fn.substr(0, fn.size() - 3);
-            t.patched = t.uncompressed.substr(0, t.uncompressed.size() - 5) + "Upd.bars";
-            t.patched_zstd = t.patched + ".zs";
-
-            if (!g_list_only)
+            std::string fn = e.path().filename().string();
+            if (EndsWith(fn, ".bars.zs") && !EndsWith(fn, "Upd.bars.zs"))
             {
-                modder.RunCmd(std::string(kZstd) + " -d -f " + t.original_zstd + " -o " + t.uncompressed);
-            }
-            else
-            {
-                std::system((std::string(kZstd) + " -d -q -f " + t.original_zstd + " -o " + t.uncompressed).c_str());
-            }
+                BarsTarget t;
+                t.original_zstd = fn;
+                t.uncompressed = fn.substr(0, fn.size() - 3);
+                t.patched = t.uncompressed.substr(0, t.uncompressed.size() - 5) + "Upd.bars";
+                t.patched_zstd = t.patched + ".zs";
 
-            t.names = modder.ParseBarsNames(t.uncompressed);
-            all_names.insert(all_names.end(), t.names.begin(), t.names.end());
-            b_targets.push_back(t);
+                if (!g_list_only)
+                {
+                    modder.RunCmd(std::string(kZstd) + " -d -f " + t.original_zstd + " -o " + t.uncompressed);
+                }
+                else
+                {
+                    std::system((std::string(kZstd) + " -d -q -f " + t.original_zstd + " -o " + t.uncompressed).c_str());
+                }
+
+                t.names = modder.ParseBarsNames(t.uncompressed);
+                all_names.insert(all_names.end(), t.names.begin(), t.names.end());
+                b_targets.push_back(t);
+            }
+        }
+
+        if (b_targets.empty())
+        {
+            std::cerr << "[Fatal Error] No .bars.zs files found in the current directory.\n";
+            return 1;
         }
     }
 
-    if (b_targets.empty())
-    {
-        std::cerr << "[Fatal Error] No .bars.zs files found in the current directory.\n";
-        return 1;
-    }
-
-    // --- Headless UI Orchestrator Hooks ---
     if (g_list_only)
     {
         for (const auto &name : all_names)
@@ -853,16 +841,22 @@ int main(int argc, char *argv[])
     {
         for (const auto &e : fs::directory_iterator(input_path))
         {
-            AudioMetadata m = GetAudioMetadata(e.path());
-            if (m.is_audio)
-                modder.Build(e.path(), m, b_targets, all_names, ex_mods, cfg, t_over, c_over, auto_yes, is_headless);
+            if (IsValidAudioExtension(e.path()))
+            {
+                modder.Build(e.path(), b_targets, all_names, ex_mods, cfg, t_over, c_over, auto_yes, is_headless);
+            }
         }
     }
     else
     {
-        AudioMetadata m = GetAudioMetadata(input_path);
-        if (m.is_audio)
-            modder.Build(input_path, m, b_targets, all_names, ex_mods, cfg, t_over, c_over, auto_yes, is_headless);
+        if (IsValidAudioExtension(input_path))
+        {
+            modder.Build(input_path, b_targets, all_names, ex_mods, cfg, t_over, c_over, auto_yes, is_headless);
+        }
+        else
+        {
+            std::cerr << "[Fatal Error] Input file is not a supported audio format.\n";
+        }
     }
 
     if (!no_patch)
